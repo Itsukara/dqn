@@ -1,0 +1,9 @@
+* COMPRESS = False
+94.4 TIMESTEP/sec, replay_memory_size=2718.6MB (2718.6MB if not compressed)
+
+* COMPRESS = True
+81.4 TIMESTEP/sec, replay_memory_size=981.8MB (42555.0MB if not compressed)
+
+* Effect
+Speed   = 81.4 / 94.4       = 86%
+Memory  = 981.8MB / 42555MB = 1/43 

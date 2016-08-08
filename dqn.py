@@ -10,12 +10,17 @@ from skimage.color import rgb2gray
 from skimage.transform import resize
 from keras.models import Sequential
 from keras.layers import Convolution2D, Flatten, Dense
+from matplotlib import pyplot as plt
+import lzma
+import time
 
 KERAS_BACKEND = 'tensorflow'
 
 ENV_NAME = 'Breakout-v0'  # Environment name
 FRAME_WIDTH = 84  # Resized frame width
-FRAME_HEIGHT = 84  # Resized frame height
+FRAME_HEIGHT = 84  # Cropped frame height
+RESIZED_HEIGHT = 110 # Resized frame height
+CROP_OFFSET = 17 # Offset for height cropping
 NUM_EPISODES = 12000  # Number of episodes the agent plays
 STATE_LENGTH = 4  # Number of most recent frames to produce the input to the network
 GAMMA = 0.99  # Discount factor
@@ -38,6 +43,8 @@ TRAIN = True
 SAVE_NETWORK_PATH = 'saved_networks/' + ENV_NAME
 SAVE_SUMMARY_PATH = 'summary/' + ENV_NAME
 NUM_EPISODES_AT_TEST = 30  # Number of episodes the agent plays at test time
+screen_no = 0 # Initial nuumber of screen output sub directory
+COMPRESS = True # Compress replay memory or not
 
 
 class Agent():
@@ -56,7 +63,12 @@ class Agent():
         self.episode = 0
 
         # Create replay memory
-        self.replay_memory = deque()
+        # self.replay_memory = deque()
+        self.replay_memory = list(range(NUM_REPLAY_MEMORY))
+        self.replay_size = 0
+        self.replay_slot = 0
+        self.replay_memory_size = 0
+        self.replay_index = np.arange(NUM_REPLAY_MEMORY)
 
         # Create q network
         self.s, self.q_values, q_network = self.build_network()
@@ -67,7 +79,7 @@ class Agent():
         target_network_weights = target_network.trainable_weights
 
         # Define target network update operation
-        self.update_target_network = [target_network_weights[i].assign(q_network_weights[i]) for i in xrange(len(target_network_weights))]
+        self.update_target_network = [target_network_weights[i].assign(q_network_weights[i]) for i in range(len(target_network_weights))]
 
         # Define loss and gradient update operation
         self.a, self.y, self.loss, self.grad_update = self.build_training_op(q_network_weights)
@@ -91,11 +103,10 @@ class Agent():
 
     def build_network(self):
         model = Sequential()
-        model.add(Convolution2D(32, 8, 8, subsample=(4, 4), activation='relu', input_shape=(STATE_LENGTH, FRAME_WIDTH, FRAME_HEIGHT)))
-        model.add(Convolution2D(64, 4, 4, subsample=(2, 2), activation='relu'))
-        model.add(Convolution2D(64, 3, 3, subsample=(1, 1), activation='relu'))
+        model.add(Convolution2D(16, 8, 8, subsample=(4, 4), activation='relu', input_shape=(STATE_LENGTH, FRAME_WIDTH, FRAME_HEIGHT)))
+        model.add(Convolution2D(32, 4, 4, subsample=(2, 2), activation='relu'))
         model.add(Flatten())
-        model.add(Dense(512, activation='relu'))
+        model.add(Dense(256, activation='relu'))
         model.add(Dense(self.num_actions))
 
         s = tf.placeholder(tf.float32, [None, STATE_LENGTH, FRAME_WIDTH, FRAME_HEIGHT])
@@ -124,8 +135,12 @@ class Agent():
 
     def get_initial_state(self, observation, last_observation):
         processed_observation = np.maximum(observation, last_observation)
-        processed_observation = np.uint8(resize(rgb2gray(processed_observation), (FRAME_WIDTH, FRAME_HEIGHT)) * 255)
-        state = [processed_observation for _ in xrange(STATE_LENGTH)]
+
+        resized_image = resize(rgb2gray(processed_observation), (RESIZED_HEIGHT, FRAME_WIDTH))
+        cropped_image = resized_image[CROP_OFFSET:CROP_OFFSET+FRAME_HEIGHT, :]
+        processed_observation = np.uint8(cropped_image * 255)
+
+        state = [processed_observation for _ in range(STATE_LENGTH)]
         return np.stack(state, axis=0)
 
     def get_action(self, state):
@@ -151,9 +166,19 @@ class Agent():
         reward = np.sign(reward)
 
         # Store transition in replay memory
-        self.replay_memory.append((state, action, reward, next_state, terminal))
-        if len(self.replay_memory) > NUM_REPLAY_MEMORY:
-            self.replay_memory.popleft()
+        if COMPRESS:
+            state_c = lzma.compress(state.tobytes(), preset=0)
+            observation_c = lzma.compress(observation.tobytes(), preset=0)
+            self.replay_memory[self.replay_slot] = (state_c, action, reward, observation_c, terminal)
+            if self.replay_size < NUM_REPLAY_MEMORY:
+                self.replay_memory_size += len(state_c) + len(observation_c)
+        else:
+            self.replay_memory[self.replay_slot] = (state, action, reward, next_state, terminal)
+            if self.replay_size < NUM_REPLAY_MEMORY:
+                self.replay_memory_size += 4 * 84 * 84
+        self.replay_slot = (self.replay_slot + 1) % NUM_REPLAY_MEMORY
+        self.replay_size = min(self.replay_size + 1, NUM_REPLAY_MEMORY)
+        # print("replay_slot={}, replay_size={}".format(self.replay_slot, self.replay_size))
 
         if self.t >= INITIAL_REPLAY_SIZE:
             # Train network
@@ -178,7 +203,7 @@ class Agent():
             if self.t >= INITIAL_REPLAY_SIZE:
                 stats = [self.total_reward, self.total_q_max / float(self.duration),
                         self.duration, self.total_loss / (float(self.duration) / float(TRAIN_INTERVAL))]
-                for i in xrange(len(stats)):
+                for i in range(len(stats)):
                     self.sess.run(self.update_ops[i], feed_dict={
                         self.summary_placeholders[i]: float(stats[i])
                     })
@@ -216,12 +241,22 @@ class Agent():
         y_batch = []
 
         # Sample random minibatch of transition from replay memory
-        minibatch = random.sample(self.replay_memory, BATCH_SIZE)
+        # minibatch = random.sample(self.replay_memory[:self.replay_size], BATCH_SIZE)
+        # minibatch_index = np.random.choice(self.replay_index[:self.replay_size], BATCH_SIZE)
+        # minibatch = [self.replay_memory[i] for i in minibatch_index]
+        minibatch = random.sample(self.replay_index[:self.replay_size], BATCH_SIZE)
         for data in minibatch:
-            state_batch.append(data[0])
+            if COMPRESS:
+                state = np.frombuffer(lzma.decompress(data[0]), dtype=np.uint8).reshape([4, 84, 84])
+                observation = np.frombuffer(lzma.decompress(data[3]), dtype=np.uint8).reshape([1, 84, 84])
+                next_state = np.append(state[1:, :, :], observation, axis=0)
+            else:
+                state = data[0]
+                next_state = data[3]
+            state_batch.append(state)
             action_batch.append(data[1])
             reward_batch.append(data[2])
-            next_state_batch.append(data[3])
+            next_state_batch.append(next_state)
             terminal_batch.append(data[4])
 
         # Convert True to 1, False to 0
@@ -248,8 +283,8 @@ class Agent():
         episode_avg_loss = tf.Variable(0.)
         tf.scalar_summary(ENV_NAME + '/Average Loss/Episode', episode_avg_loss)
         summary_vars = [episode_total_reward, episode_avg_max_q, episode_duration, episode_avg_loss]
-        summary_placeholders = [tf.placeholder(tf.float32) for _ in xrange(len(summary_vars))]
-        update_ops = [summary_vars[i].assign(summary_placeholders[i]) for i in xrange(len(summary_vars))]
+        summary_placeholders = [tf.placeholder(tf.float32) for _ in range(len(summary_vars))]
+        update_ops = [summary_vars[i].assign(summary_placeholders[i]) for i in range(len(summary_vars))]
         summary_op = tf.merge_all_summaries()
         return summary_placeholders, update_ops, summary_op
 
@@ -278,19 +313,26 @@ class Agent():
 
 def preprocess(observation, last_observation):
     processed_observation = np.maximum(observation, last_observation)
-    processed_observation = np.uint8(resize(rgb2gray(processed_observation), (FRAME_WIDTH, FRAME_HEIGHT)) * 255)
+
+    resized_image = resize(rgb2gray(processed_observation), (RESIZED_HEIGHT, FRAME_WIDTH))
+    cropped_image = resized_image[CROP_OFFSET:CROP_OFFSET+FRAME_HEIGHT, :]
+    processed_observation = np.uint8(cropped_image * 255)
+
     return np.reshape(processed_observation, (1, FRAME_WIDTH, FRAME_HEIGHT))
 
 
 def main():
     env = gym.make(ENV_NAME)
     agent = Agent(num_actions=env.action_space.n)
+    start_time = time.time()
+    random_mode = True
 
+           
     if TRAIN:  # Train mode
-        for _ in xrange(NUM_EPISODES):
+        for _ in range(NUM_EPISODES):
             terminal = False
             observation = env.reset()
-            for _ in xrange(random.randint(1, NO_OP_STEPS)):
+            for _ in range(random.randint(1, NO_OP_STEPS)):
                 last_observation = observation
                 observation, _, _, _ = env.step(0)  # Do nothing
             state = agent.get_initial_state(observation, last_observation)
@@ -301,12 +343,21 @@ def main():
                 # env.render()
                 processed_observation = preprocess(observation, last_observation)
                 state = agent.run(state, action, reward, terminal, processed_observation)
+                elapsed_time = time.time() - start_time
+                elapsed_steps = agent.t
+                if not random_mode:
+                    elapsed_steps -= INITIAL_REPLAY_SIZE
+                if elapsed_steps % 1000 == 0:
+                    print("{:.1f} TIMESTEP/sec, replay_memory_size={:.1f}MB ({:.1f}MB if not compressed)".format(elapsed_steps / elapsed_time, agent.replay_memory_size/(1024*1024), agent.replay_size * 4 * 84 * 84 / (1024*1024)))
+                if agent.t > INITIAL_REPLAY_SIZE and random_mode:
+                    random_mode = False
+                    start_time = time.time()
     else:  # Test mode
-        # env.monitor.start(ENV_NAME + '-test')
-        for _ in xrange(NUM_EPISODES_AT_TEST):
+        env.monitor.start(ENV_NAME + '-test')
+        for _ in range(NUM_EPISODES_AT_TEST):
             terminal = False
             observation = env.reset()
-            for _ in xrange(random.randint(1, NO_OP_STEPS)):
+            for _ in range(random.randint(1, NO_OP_STEPS)):
                 last_observation = observation
                 observation, _, _, _ = env.step(0)  # Do nothing
             state = agent.get_initial_state(observation, last_observation)
@@ -317,7 +368,7 @@ def main():
                 env.render()
                 processed_observation = preprocess(observation, last_observation)
                 state = np.append(state[1:, :, :], processed_observation, axis=0)
-        # env.monitor.close()
+        env.monitor.close()
 
 
 if __name__ == '__main__':
